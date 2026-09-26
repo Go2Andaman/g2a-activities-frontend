@@ -14,7 +14,7 @@
             v-model="pickupDate"
             type="date"
             label="Pickup Date"
-            :min="tomorrowString"
+            :min="todayString"
             :error-messages="error ? [error] : []"
             variant="outlined"
             density="compact"
@@ -104,9 +104,23 @@ const props = defineProps({
     type: Number,
     default: 0,
   },
+
+  // From the check-available API's `availability.service_hours` - an array
+  // of `{ start_time, end_time }` windows used to generate the pickup time
+  // slots below (see Pickuptimefield.vue / PickupAndDropLocationField.vue,
+  // which use the same generator).
+  serviceHours: {
+    type: Array,
+    default: () => [],
+  },
 });
 
 const todayDate = new Date();
+
+// Only past dates are actually barred - same-day/lead-time rules are the
+// backend's job (it already reports them back via check-available), so the
+// picker itself shouldn't pre-emptively rule out today.
+const todayString = todayDate.toISOString().split("T")[0];
 
 const tomorrow = new Date(todayDate);
 tomorrow.setDate(tomorrow.getDate() + 1);
@@ -118,39 +132,111 @@ dayAfterTomorrow.setDate(dayAfterTomorrow.getDate() + 2);
 
 const dayAfterTomorrowString = dayAfterTomorrow.toISOString().split("T")[0];
 
-const PICKUP_TIME_SLOTS = [
-  { title: "10:00 AM", value: "10:00" },
-  { title: "10:30 AM", value: "10:30" },
-  { title: "11:00 AM", value: "11:00" },
-  { title: "11:30 AM", value: "11:30" },
-  { title: "12:00 PM", value: "12:00" },
-  { title: "12:30 PM", value: "12:30" },
-  { title: "1:00 PM", value: "13:00" },
-  { title: "1:30 PM", value: "13:30" },
-  { title: "2:00 PM", value: "14:00" },
-  { title: "2:30 PM", value: "14:30" },
-  { title: "3:00 PM", value: "15:00" },
-  { title: "3:30 PM", value: "15:30" },
-  { title: "4:00 PM", value: "16:00" },
-  { title: "4:30 PM", value: "16:30" },
-  { title: "5:00 PM", value: "17:00" },
-  { title: "5:30 PM", value: "17:30" },
-  { title: "6:00 PM", value: "18:00" },
-];
+// ---------------------------------------------------------------------
+// Pickup time slot generation
+//
+// `serviceHours` is an array of `{ start_time, end_time }` windows (both
+// "HH:mm" or "HH:mm:ss" strings) - a product can have more than one
+// service window per day (e.g. a morning and an evening shift). Slots are
+// generated per window at a fixed 30-minute cadence, merged, deduped and
+// sorted. This also supports overnight windows (e.g. start 22:00, end
+// 06:00) and rounds ragged boundary times like "22:29:00" down/up to the
+// nearest valid slot. With no windows configured, the whole day is used.
+// (Same generator as Pickuptimefield.vue / PickupAndDropLocationField.vue.)
+// ---------------------------------------------------------------------
 
-// The pickup time must be at least `minBookingLeadHours` (from the
-// check-available API's `availability.min_booking_lead_hours`) ahead of
-// now - compared as full date-times (not a same-day-only check) so a lead
-// time spanning past midnight still disables the relevant slots on the
-// following day too, same as Pickuptimefield.vue.
-const cutoffDateTime = computed(() => {
-  const cutoff = new Date();
+const SLOT_INTERVAL_MINUTES = 30;
+const MINUTES_IN_DAY = 24 * 60;
 
-  cutoff.setMinutes(
-    cutoff.getMinutes() + (Number(props.minBookingLeadHours) || 0) * 60,
-  );
+const parseTimeToMinutes = (value, fallback) => {
+  if (!value || typeof value !== "string") return fallback;
 
-  return cutoff;
+  const [hoursStr, minutesStr] = value.split(":");
+  const hours = Number(hoursStr);
+  const minutes = Number(minutesStr);
+
+  if (Number.isNaN(hours) || Number.isNaN(minutes)) return fallback;
+
+  return hours * 60 + minutes;
+};
+
+const formatMinutesToHHmm = (totalMinutes) => {
+  const normalized =
+    ((totalMinutes % MINUTES_IN_DAY) + MINUTES_IN_DAY) % MINUTES_IN_DAY;
+  const hours = Math.floor(normalized / 60);
+  const minutes = normalized % 60;
+
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+};
+
+const formatMinutesToLabel = (totalMinutes) => {
+  const normalized =
+    ((totalMinutes % MINUTES_IN_DAY) + MINUTES_IN_DAY) % MINUTES_IN_DAY;
+  const hours24 = Math.floor(normalized / 60);
+  const minutes = normalized % 60;
+
+  const period = hours24 >= 12 ? "PM" : "AM";
+  const hours12 = hours24 % 12 === 0 ? 12 : hours24 % 12;
+
+  return `${String(hours12).padStart(2, "0")}:${String(minutes).padStart(2, "0")} ${period}`;
+};
+
+// Rounds each configured window's start up, and end down, to the nearest
+// slot boundary so every generated option is bookable and none of them
+// spill outside the service window. If a window's end <= start, it's
+// treated as spanning midnight (e.g. 22:00 -> 06:00). No windows at all
+// falls back to the full day, matching the old single-object default.
+const serviceWindows = computed(() => {
+  const windows = Array.isArray(props.serviceHours) ? props.serviceHours : [];
+
+  if (!windows.length) {
+    return [{ start: 0, end: MINUTES_IN_DAY }];
+  }
+
+  return windows.map((window) => {
+    const rawStart = parseTimeToMinutes(window?.start_time, 0);
+    const rawEnd = parseTimeToMinutes(window?.end_time, MINUTES_IN_DAY);
+
+    const start =
+      Math.ceil(rawStart / SLOT_INTERVAL_MINUTES) * SLOT_INTERVAL_MINUTES;
+
+    let end = Math.ceil(rawEnd / SLOT_INTERVAL_MINUTES) * SLOT_INTERVAL_MINUTES;
+
+    if (end <= start) {
+      end += MINUTES_IN_DAY;
+    }
+
+    return { start, end };
+  });
+});
+
+// `value` stays in 24-hour HH:mm form - that's what the backend's
+// pickup_time validation expects. `title` is just the display label.
+// Generated fresh whenever serviceHours changes, one pass per window,
+// then deduped and sorted so overlapping windows don't produce repeats.
+const PICKUP_TIME_SLOTS = computed(() => {
+  const seen = new Set();
+  const slots = [];
+
+  for (const { start, end } of serviceWindows.value) {
+    for (
+      let minutes = start;
+      minutes <= end;
+      minutes += SLOT_INTERVAL_MINUTES
+    ) {
+      const value = formatMinutesToHHmm(minutes);
+
+      if (seen.has(value)) continue;
+      seen.add(value);
+
+      slots.push({
+        title: formatMinutesToLabel(minutes),
+        value,
+      });
+    }
+  }
+
+  return slots.sort((a, b) => a.value.localeCompare(b.value));
 });
 
 const slotDateTime = (dateStr, hhmm) => {
@@ -189,7 +275,7 @@ const computeNextAvailableSlot = (minLeadHours) => {
 
     const dateStr = formatDateToYMD(candidate);
 
-    const firstSlot = PICKUP_TIME_SLOTS.find(
+    const firstSlot = PICKUP_TIME_SLOTS.value.find(
       (slot) => slotDateTime(dateStr, slot.value) >= cutoff,
     );
 
@@ -200,29 +286,15 @@ const computeNextAvailableSlot = (minLeadHours) => {
 
   // Shouldn't happen with any realistic lead time - avoid leaving the
   // form without a value if it does.
-  return { date: tomorrowString, time: PICKUP_TIME_SLOTS[0].value };
+  return {
+    date: tomorrowString,
+    time: PICKUP_TIME_SLOTS.value[0]?.value ?? "00:00",
+  };
 };
 
-// VSelect's item-level overrides (disabled included) only take effect when
-// nested under `props` on each raw item - see VSelect's `select()`, which
-// checks `item.props.disabled`, and the `useItems` composable, which
-// spreads a raw item's `props` key onto the internal item. A flat
-// `disabled` key (or an `item-disabled` binding, which isn't a real prop
-// on this VSelect) is silently ignored.
-const pickupTimeOptions = computed(() => {
-  const cutoff = cutoffDateTime.value;
-
-  return PICKUP_TIME_SLOTS.map((slot) => {
-    const slotDate = slotDateTime(pickupDate.value, slot.value);
-    const disabled = !!slotDate && slotDate < cutoff;
-
-    return {
-      ...slot,
-      disabled,
-      props: { disabled },
-    };
-  });
-});
+// All slots are always selectable - lead-time/availability rules are
+// enforced by the backend (via check-available), not pre-emptively here.
+const pickupTimeOptions = PICKUP_TIME_SLOTS;
 
 // Tracks whether the pickup date/time reflects a deliberate choice - either
 // a booking resumed with values already in `form`, or the customer editing
@@ -257,7 +329,11 @@ const pickupDate = computed({
 
 const pickupTime = computed({
   get() {
-    return props.form.pickup_time || "10:00";
+    // Falls back to the first slot rather than "" - pickup_time must
+    // never sit blank, since the check-available API rejects an empty
+    // value outright (a 400, not a normal "unavailable" result), and
+    // slots are no longer disabled client-side to justify clearing it.
+    return props.form.pickup_time || PICKUP_TIME_SLOTS.value[0]?.value || "";
   },
   set(value) {
     if (!isAutoSetting) hasUserSetPickup.value = true;
@@ -331,22 +407,6 @@ watch(
   },
   { immediate: true },
 );
-
-// If the pickup date changes (or time passes) and the currently selected
-// pickup time falls before the new lead-hours cutoff, it's no longer a
-// valid choice - drop it instead of silently keeping a disabled option
-// selected, same as Pickuptimefield.vue.
-watch(pickupTimeOptions, (options) => {
-  const current = props.form.pickup_time;
-
-  if (!current) return;
-
-  const option = options.find((item) => item.value === current);
-
-  if (option?.disabled) {
-    props.form.pickup_time = "";
-  }
-});
 </script>
 
 <style scoped>
